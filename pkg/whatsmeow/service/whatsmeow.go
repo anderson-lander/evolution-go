@@ -1400,10 +1400,44 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				isMedia = true
 			}
 
+			// Antes de baixar: o tamanho declarado e quem vai receber o evento (media_guard.go).
+			// Sem isso, uma instância que nem assina MESSAGE baixava e codificava qualquer vídeo.
+			if isMedia {
+				var declaredSize uint64
+				switch {
+				case img != nil:
+					declaredSize = img.GetFileLength()
+				case audio != nil:
+					declaredSize = audio.GetFileLength()
+				case document != nil:
+					declaredSize = document.GetFileLength()
+				case video != nil:
+					declaredSize = video.GetFileLength()
+				case sticker != nil:
+					declaredSize = sticker.GetFileLength()
+				case associatedImg != nil:
+					declaredSize = associatedImg.GetFileLength()
+				case associatedAudio != nil:
+					declaredSize = associatedAudio.GetFileLength()
+				case associatedDocument != nil:
+					declaredSize = associatedDocument.GetFileLength()
+				case associatedVideo != nil:
+					declaredSize = associatedVideo.GetFileLength()
+				case associatedSticker != nil:
+					declaredSize = associatedSticker.GetFileLength()
+				}
+
+				if reason := MediaSkipReason(mycli.config, mycli.Instance, "Message", evt.Info.Chat.String(), declaredSize); reason != "" {
+					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Skipping media download - ID: %s, Size: %d bytes, Reason: %s", mycli.userID, evt.Info.ID, declaredSize, reason)
+					isMedia = false
+				}
+			}
+
 			if isMedia {
 				mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Processing media message - ID: %s", mycli.userID, evt.Info.ID)
 
 				var data []byte
+				tooLarge := false
 				var err error
 				var extension string
 				var mimeType string
@@ -1547,6 +1581,13 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					if actualSize > 13*1024*1024 { // 13MB
 						mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Processing large file (>13MB) - ID: %s, Size: %d bytes", mycli.userID, evt.Info.ID, actualSize)
 					}
+
+					// Veio sem FileLength e só agora se sabe o tamanho: não vira base64.
+					if MediaTooLarge(mycli.config, actualSize) {
+						mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Media above WEBHOOK_FILES_MAX_MB, not attaching - ID: %s, Size: %d bytes", mycli.userID, evt.Info.ID, actualSize)
+						data = nil
+						tooLarge = true
+					}
 				}
 
 				messageMap, ok := dataMap["Message"].(map[string]interface{})
@@ -1585,7 +1626,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 						mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Base64 encoding completed - ID: %s, Original: %d bytes, Encoded: %d chars, Duration: %v", mycli.userID, evt.Info.ID, len(data), len(encodeData), encodeDuration)
 						messageMap["base64"] = encodeData
 					}
-				} else {
+				} else if !tooLarge {
 					mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Skipping media storage due to download failure - ID: %s", mycli.userID, evt.Info.ID)
 				}
 
@@ -2117,24 +2158,10 @@ func (w *whatsmeowService) CallWebhook(instance *instance_model.Instance, queueN
 		return
 	}
 
-	eventArray := strings.Split(instance.Events, ",")
-
-	var subscriptions []string
-
-	if len(eventArray) < 1 {
-		subscriptions = append(subscriptions, event_types.MESSAGE)
-		subscriptions = append(subscriptions, event_types.SEND_MESSAGE)
-	} else {
-		for _, arg := range eventArray {
-			if !event_types.IsEventType(arg) {
-				w.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] Message type discarded: %s", instance.Id, arg)
-				continue
-			}
-			if !utils.Find(subscriptions, arg) {
-				subscriptions = append(subscriptions, arg)
-			}
-
-		}
+	// Mesma leitura que MediaSkipReason usa para decidir se baixa a mídia (media_guard.go).
+	subscriptions, discarded := ParseSubscriptions(instance.Events)
+	for _, arg := range discarded {
+		w.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] Message type discarded: %s", instance.Id, arg)
 	}
 
 	if contains(subscriptions, "ALL") {

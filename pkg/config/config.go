@@ -29,6 +29,8 @@ type Config struct {
 	WaDebug              string
 	LogType              string
 	WebhookFiles         bool
+	// Mídia acima disto não é baixada nem anexada em base64 ao webhook (0 = sem limite).
+	WebhookFilesMaxBytes int64
 	ConnectOnStartup     bool
 	OsName               string
 	AmqpUrl              string
@@ -68,6 +70,28 @@ type Config struct {
 	LogMaxAge     int
 	LogDirectory  string
 	LogCompress   bool
+}
+
+// DefaultWebhookFilesMaxMB é o teto padrão de mídia anexada ao webhook. O arquivo vai em base64
+// (4/3 do tamanho) e o JSON do evento é montado e relido algumas vezes na memória: um vídeo de
+// 73 MB virou 102 MB de base64 e derrubou por memória um servidor de 512 MB.
+const DefaultWebhookFilesMaxMB = 25
+
+// ParseWebhookFilesMaxMB lê WEBHOOK_FILES_MAX_MB e devolve o teto em bytes. Vazio ou inválido
+// usa o padrão; "0" (ou negativo) desliga o teto.
+func ParseWebhookFilesMaxMB(raw string) int64 {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return DefaultWebhookFilesMaxMB * 1024 * 1024
+	}
+	mb, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return DefaultWebhookFilesMaxMB * 1024 * 1024
+	}
+	if mb <= 0 {
+		return 0
+	}
+	return mb * 1024 * 1024
 }
 
 // EnsureDBExists connects to postgres (without the target database) and creates it if it doesn't exist.
@@ -240,6 +264,8 @@ func Load() *Config {
 		webhookFiles = "true"
 	}
 
+	webhookFilesMaxBytes := ParseWebhookFilesMaxMB(os.Getenv(config_env.WEBHOOK_FILES_MAX_MB))
+
 	connectOnStartup := os.Getenv(config_env.CONNECT_ON_STARTUP)
 	if connectOnStartup == "" {
 		connectOnStartup = "false"
@@ -350,6 +376,7 @@ func Load() *Config {
 		WaDebug:              waDebug,
 		LogType:              logType,
 		WebhookFiles:         webhookFiles == "true",
+		WebhookFilesMaxBytes: webhookFilesMaxBytes,
 		ConnectOnStartup:     connectOnStartup == "true",
 		OsName:               osName,
 		AmqpUrl:              amqpUrl,

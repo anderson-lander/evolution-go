@@ -60,6 +60,7 @@ POSTGRES_USERS_DB=postgresql://user:pass@host:5432/evogo_users?sslmode=disable
 |----------|--------|-----------|
 | `CONNECT_ON_STARTUP` | `false` | Conectar instâncias ao iniciar servidor |
 | `WEBHOOK_FILES` | `true` | Enviar URLs de mídia em webhooks |
+| `WEBHOOK_FILES_MAX_MB` | `25` | Mídia acima disto não é baixada nem anexada ao webhook (`0` = sem limite). Com ou sem limite, a mídia só é baixada se alguma assinatura da instância recebe o evento |
 | `QRCODE_MAX_COUNT` | `5` | Tentativas máximas de QR Code |
 | `CHECK_USER_EXISTS` | `true` | Validar destinatário antes de enviar |
 

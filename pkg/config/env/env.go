@@ -13,6 +13,7 @@ const (
 	WA_DEBUG                = "DEBUG_ENABLED"
 	LOGTYPE                 = "LOG_TYPE"
 	WEBHOOKFILES            = "WEBHOOK_FILES"
+	WEBHOOK_FILES_MAX_MB    = "WEBHOOK_FILES_MAX_MB"
 	CONNECT_ON_STARTUP      = "CONNECT_ON_STARTUP"
 	OS_NAME                 = "OS_NAME"
 	AMQP_URL                = "AMQP_URL"

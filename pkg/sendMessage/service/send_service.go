@@ -2824,7 +2824,31 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 
 	postMap["data"] = messageData
 
-	if isMedia && s.config.WebhookFiles {
+	// O arquivo que acabou de ser enviado é BAIXADO DE NOVO só para ir em base64 no webhook. Não
+	// vale a pena quando nenhuma assinatura recebe o SendMessage ou quando ele passa do teto
+	// (ver whatsmeow_service.MediaSkipReason).
+	attachMedia := isMedia && s.config.WebhookFiles
+	if attachMedia {
+		var declaredSize uint64
+		switch {
+		case msg.GetImageMessage() != nil:
+			declaredSize = msg.GetImageMessage().GetFileLength()
+		case msg.GetAudioMessage() != nil:
+			declaredSize = msg.GetAudioMessage().GetFileLength()
+		case msg.GetDocumentMessage() != nil:
+			declaredSize = msg.GetDocumentMessage().GetFileLength()
+		case msg.GetVideoMessage() != nil:
+			declaredSize = msg.GetVideoMessage().GetFileLength()
+		case msg.GetStickerMessage() != nil:
+			declaredSize = msg.GetStickerMessage().GetFileLength()
+		}
+		if reason := whatsmeow_service.MediaSkipReason(s.config, instance, "SendMessage", recipient.String(), declaredSize); reason != "" {
+			s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Skipping media re-download for webhook - ID: %s, Size: %d bytes, Reason: %s", instance.Id, message, declaredSize, reason)
+			attachMedia = false
+		}
+	}
+
+	if attachMedia {
 		var data []byte
 		var err error
 
@@ -2856,7 +2880,9 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 			}
 		}
 
-		if err == nil {
+		if err == nil && whatsmeow_service.MediaTooLarge(s.config, len(data)) {
+			s.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] Sent media above WEBHOOK_FILES_MAX_MB, not attaching - ID: %s, Size: %d bytes", instance.Id, message, len(data))
+		} else if err == nil {
 			// Acessando o Message do map já convertido
 			messageMap := msgMap
 			if messageMap == nil {
