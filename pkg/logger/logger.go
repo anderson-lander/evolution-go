@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/evolution-foundation/evolution-go/pkg/config"
+	"github.com/evolution-foundation/evolution-go/pkg/redact"
 	"github.com/gomessguii/logger"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
@@ -91,27 +92,34 @@ func newLogger(instanceId string, config *config.Config) *Logger {
 	}
 }
 
+// Lander, 0.7.2-lander.2: a mensagem é montada UMA vez e passa pelo
+// redact antes de ir para o console (o log do serviço) e para o arquivo da
+// instância (que /instance/logs devolve). Ver pkg/redact.
 func (l *Logger) LogInfo(format string, args ...interface{}) {
-	l.log("INFO", format, args...)
-	logger.LogInfo(format, args...)
+	msg := redact.Text(fmt.Sprintf(format, args...))
+	l.log("INFO", msg)
+	logger.LogInfo("%s", msg)
 }
 
 func (l *Logger) LogError(format string, args ...interface{}) {
-	l.log("ERROR", format, args...)
-	logger.LogError(format, args...)
+	msg := redact.Text(fmt.Sprintf(format, args...))
+	l.log("ERROR", msg)
+	logger.LogError("%s", msg)
 }
 
 func (l *Logger) LogWarn(format string, args ...interface{}) {
-	l.log("WARN", format, args...)
-	logger.LogWarn(format, args...)
+	msg := redact.Text(fmt.Sprintf(format, args...))
+	l.log("WARN", msg)
+	logger.LogWarn("%s", msg)
 }
 
 func (l *Logger) LogDebug(format string, args ...interface{}) {
-	l.log("DEBUG", format, args...)
-	logger.LogDebug(format, args...)
+	msg := redact.Text(fmt.Sprintf(format, args...))
+	l.log("DEBUG", msg)
+	logger.LogDebug("%s", msg)
 }
 
-func (l *Logger) log(level string, format string, args ...interface{}) {
+func (l *Logger) log(level string, msg string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -119,7 +127,7 @@ func (l *Logger) log(level string, format string, args ...interface{}) {
 		Timestamp:  time.Now(),
 		Level:      level,
 		InstanceId: l.instanceId,
-		Message:    fmt.Sprintf(format, args...),
+		Message:    msg,
 	}
 
 	jsonEntry, err := json.Marshal(entry)

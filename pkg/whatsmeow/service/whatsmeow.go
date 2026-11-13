@@ -48,6 +48,7 @@ import (
 	poll_service "github.com/evolution-foundation/evolution-go/pkg/poll/service"
 	storage_interfaces "github.com/evolution-foundation/evolution-go/pkg/storage/interfaces"
 	"github.com/evolution-foundation/evolution-go/pkg/utils"
+	"github.com/evolution-foundation/evolution-go/pkg/whatsmeow/lifecycle"
 )
 
 type WhatsmeowService interface {
@@ -55,6 +56,8 @@ type WhatsmeowService interface {
 	ConnectOnStartup(clientName string)
 	StartInstance(instanceId string) error
 	ReconnectClient(instanceId string) error
+	// DiscardClient removes a client from memory, keeping the pairing (Lander patch).
+	DiscardClient(instanceId string, reason string)
 	ClearInstanceCache(instanceId string, token string) error
 	CallWebhook(instance *instance_model.Instance, queueName string, jsonData []byte)
 	SendToGlobalQueues(event string, jsonData []byte, userId string)
@@ -174,15 +177,29 @@ type ProxyConfig struct {
 func (w whatsmeowService) ReconnectClient(instanceId string) error {
 	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Starting reconnection process - simulating restart", instanceId)
 
+	// Lander patch: a start already running for this instance IS the
+	// reconnection. Tearing it down here left the instance with no client.
+	if lifecycle.Default.IsStarting(instanceId) {
+		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] A start is already in progress, not reconnecting again", instanceId)
+		return nil
+	}
+	// Lander patch: after a 405 every automatic restart fails the same way and
+	// only adds sockets and database pools. Clean the dead client and stop.
+	if lifecycle.Default.OutdatedRecently(instanceId) {
+		w.discardClient(instanceId, nil, "reconnect refused: client outdated (405)")
+		w.loggerWrapper.GetLogger(instanceId).LogError("[%s] Reconnect refused: WhatsApp rejected the client version (405). Update the server; /instance/connect forces a new attempt", instanceId)
+		return ErrClientOutdated
+	}
+
 	// Passo 1: Limpar conexão existente se houver
-	if client, exists := w.clientPointer[instanceId]; exists {
+	oldClient := w.clientPointer[instanceId]
+	if client, exists := w.clientPointer[instanceId]; exists && client != nil {
 		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Disconnecting existing client", instanceId)
 
-		// Desconectar o cliente WebSocket
-		if client.IsConnected() {
-			client.Disconnect()
-			w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] WebSocket disconnected", instanceId)
-		}
+		// Desconectar o cliente WebSocket (Lander patch: também quando já não
+		// está conectado — um socket meio aberto segura recursos do mesmo jeito)
+		client.Disconnect()
+		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] WebSocket disconnected", instanceId)
 
 		// Remover event handler se existir
 		if mycli, ok := w.myClientPointer[instanceId]; ok {
@@ -211,10 +228,17 @@ func (w whatsmeowService) ReconnectClient(instanceId string) error {
 	delete(w.myClientPointer, instanceId)
 	delete(w.killChannel, instanceId)
 
+	// Lander patch: fecha o pool do cliente antigo (vazava um por reconexão).
+	if oldClient != nil {
+		if err := lifecycle.Default.CloseFor(instanceId, oldClient); err != nil {
+			w.loggerWrapper.GetLogger(instanceId).LogWarn("[%s] Error closing old database pool: %v", instanceId, err)
+		}
+	}
+
 	// Limpar cache de userInfo para esta instância
 	if instance, err := w.instanceRepository.GetInstanceByID(instanceId); err == nil {
 		w.userInfoCache.Delete(instance.Token)
-		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] UserInfo cache cleared for token: %s", instanceId, instance.Token)
+		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] UserInfo cache cleared for token: %s", instanceId, maskToken(instance.Token))
 	}
 
 	// Passo 3: Atualizar status no banco
@@ -314,6 +338,30 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		}
 	}
 
+	// Lander patch: one start per instance at a time. /instance/connect,
+	// /instance/qr, the send path and the Disconnected handler could all start
+	// the same instance at once — two clients on one pairing knock each other
+	// out, and each one opened its own database pool.
+	if !lifecycle.Default.TryBeginStart(cd.Instance.Id) {
+		w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn("[%s] Start already in progress, skipping duplicate start", cd.Instance.Id)
+		return
+	}
+	startReleased := false
+	releaseStart := func() {
+		if !startReleased {
+			startReleased = true
+			lifecycle.Default.EndStart(cd.Instance.Id)
+		}
+	}
+	defer releaseStart()
+
+	// Lander patch: a client that is registered but not connected is dead (no
+	// start is running, we hold the slot). It used to be silently overwritten,
+	// keeping its event handler and database pool alive forever.
+	if old := w.clientPointer[cd.Instance.Id]; old != nil {
+		w.discardClient(cd.Instance.Id, old, "replaced by a new start")
+	}
+
 	var container *sqlstore.Container
 
 	if w.config.WaDebug != "" {
@@ -335,6 +383,7 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	if err != nil {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to create container: %v", cd.Instance.Id, err)
+		lifecycle.Default.Set(cd.Instance.Id, lifecycle.PhaseFailed, "failed to open the auth database: "+err.Error())
 		return
 	}
 
@@ -344,6 +393,8 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		deviceStore, err = container.GetDevice(context.Background(), jid)
 		if err != nil {
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Erro ao obter device store: %v", cd.Instance.Id, err)
+			lifecycle.Default.Set(cd.Instance.Id, lifecycle.PhaseFailed, "failed to load the device store: "+err.Error())
+			_ = container.Close() // Lander patch: the pool leaked on this exit
 			return
 		}
 	} else {
@@ -403,6 +454,11 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		}
 	}
 
+	// Lander patch: the version above only reached DeviceProps (pairing
+	// payload). Make it reach the handshake too when it is newer than the
+	// library default — the value WhatsApp checks for "405 client outdated".
+	applyHandshakeVersion(version, w.loggerWrapper.GetLogger(cd.Instance.Id), cd.Instance.Id)
+
 	// 🔒 FIX: Sempre criar logger, mesmo que WaDebug esteja vazio
 	// Usar "INFO" como nível mínimo para garantir que logs importantes apareçam
 	minLevel := w.config.WaDebug
@@ -413,12 +469,18 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	client := whatsmeow.NewClient(deviceStore, clientLog)
 
 	w.clientPointer[cd.Instance.Id] = client
+	// Lander patch: the pool of this client is closed when the client is
+	// discarded (it used to stay open forever, one per start).
+	if previous := lifecycle.Default.SetCloser(cd.Instance.Id, client, container.Close); previous != nil {
+		_ = previous()
+	}
 
 	if cd.IsProxy {
 		var proxyConfig ProxyConfig
 		err := json.Unmarshal([]byte(cd.Instance.Proxy), &proxyConfig)
 		if err != nil {
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] error unmarshalling proxy config", cd.Instance.Id)
+			w.failStart(cd, client, fmt.Errorf("invalid proxy config: %w", err))
 			return
 		}
 
@@ -502,36 +564,11 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	// Armazena o MyClient no map para permitir atualizações posteriores
 	w.myClientPointer[cd.Instance.Id] = mycli
 
+	// Lander patch: phase tracking + a single failure exit (failStart), so a
+	// failed Connect() no longer leaves a dead client registered.
+	lifecycle.Default.Set(cd.Instance.Id, lifecycle.PhaseConnecting, "")
 	if client.Store.ID != nil {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Already logged in with JID: %s", cd.Instance.Id, client.Store.ID.String())
-		err = client.Connect()
-		if err != nil {
-			if strings.Contains(err.Error(), "EOF") {
-				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Erro de conexão WebSocket (EOF). Tentando reconectar em 5 segundos...", cd.Instance.Id)
-				time.Sleep(5 * time.Second)
-				err = client.Connect()
-				if err != nil {
-					w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Falha na segunda tentativa de conexão: %v", cd.Instance.Id, err)
-					return
-				}
-			} else if strings.Contains(err.Error(), "username/password authentication failed") {
-				w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn("[%s] Proxy authentication failed, attempting to connect without proxy", cd.Instance.Id)
-
-				// Desabilita o proxy
-				client.SetProxy(nil)
-
-				// Tenta conectar sem proxy
-				err = client.Connect()
-				if err != nil {
-					w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to connect even without proxy: %v", cd.Instance.Id, err)
-					return
-				}
-				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Successfully connected without proxy", cd.Instance.Id)
-			} else {
-				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to connect: %v", cd.Instance.Id, err)
-				return
-			}
-		}
 	} else {
 		// New-device pairing. We intentionally do NOT use client.GetQRChannel:
 		// in the installed whatsmeow its qrChannel handler auto-confirms a
@@ -539,36 +576,15 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		// QR codes run out, both of which break passkey pairing (DOC2 §4.3/§4.4).
 		// Instead we Connect() directly and consume *events.QR in myEventHandler
 		// (see handleQRCodes), which pair.go dispatches to every handler anyway.
-		err = client.Connect()
-		if err != nil {
-			if strings.Contains(err.Error(), "EOF") {
-				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Erro de conexão WebSocket (EOF). Tentando reconectar em 5 segundos...", cd.Instance.Id)
-				time.Sleep(5 * time.Second)
-				err = client.Connect()
-				if err != nil {
-					w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Falha na segunda tentativa de conexão: %v", cd.Instance.Id, err)
-					return
-				}
-			} else if strings.Contains(err.Error(), "username/password authentication failed") {
-				w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn("[%s] Proxy authentication failed during QR connection, attempting without proxy", cd.Instance.Id)
-
-				// Desabilita o proxy
-				client.SetProxy(nil)
-
-				// Tenta conectar sem proxy
-				err = client.Connect()
-				if err != nil {
-					w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to connect even without proxy: %v", cd.Instance.Id, err)
-					return
-				}
-				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Successfully connected without proxy", cd.Instance.Id)
-			} else {
-				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to connect: %v", cd.Instance.Id, err)
-				return
-			}
-		}
-
+		w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] New device: connecting to receive the QR code", cd.Instance.Id)
 	}
+	if err = w.connectWithFallback(cd, client); err != nil {
+		w.failStart(cd, client, err)
+		return
+	}
+	// Connect() returned: from here on the events drive the phase, and another
+	// start may be accepted (e.g. the kill path below restarting the client).
+	releaseStart()
 
 	// Removed auto-reconnect logic to prevent infinite loops
 
@@ -578,12 +594,26 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Received kill signal for user '%s'", cd.Instance.Id)
 			client.Disconnect()
 
-			delete(w.clientPointer, cd.Instance.Id)
-			delete(w.myClientPointer, cd.Instance.Id)
+			// Lander patch: a kill that reaches the loop of a client that was
+			// already replaced must not delete the NEW client from the maps.
+			if !lifecycle.Default.Owns(cd.Instance.Id, client) {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Kill signal for a client that was already replaced; exiting quietly", cd.Instance.Id)
+				return
+			}
+			if w.clientPointer[cd.Instance.Id] == client {
+				delete(w.clientPointer, cd.Instance.Id)
+			}
+			if m, ok := w.myClientPointer[cd.Instance.Id]; ok && m == mycli {
+				delete(w.myClientPointer, cd.Instance.Id)
+			}
+			// Lander patch: close this client's database pool before restarting.
+			if err := lifecycle.Default.CloseFor(cd.Instance.Id, client); err != nil {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn("[%s] Error closing database pool: %v", cd.Instance.Id, err)
+			}
 
 			// Limpar cache de userInfo para esta instância
 			w.userInfoCache.Delete(cd.Instance.Token)
-			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] UserInfo cache cleared for token: %s", cd.Instance.Id, cd.Instance.Token)
+			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] UserInfo cache cleared for token: %s", cd.Instance.Id, maskToken(cd.Instance.Token))
 
 			cd.Instance.Connected = false
 
@@ -629,6 +659,13 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 			w.StartClient(cd)
 			return
 		default:
+			// Lander patch: this loop used to live forever even after its
+			// client was replaced or discarded (one leaked goroutine per
+			// restart, all of them reading the same kill channel).
+			if !lifecycle.Default.Owns(cd.Instance.Id, client) {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Client loop ended: client replaced or discarded", cd.Instance.Id)
+				return
+			}
 			time.Sleep(1000 * time.Millisecond)
 		}
 	}
@@ -863,6 +900,8 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.QR:
 		// New-device pairing emits QR codes here (we connect without GetQRChannel
 		// so the socket survives a passkey ceremony). Forward + rotate them.
+		// Lander patch: a QR means WhatsApp accepted the client version.
+		lifecycle.Default.Set(mycli.userID, lifecycle.PhaseQR, "")
 		mycli.handleQRCodes(evt.Codes)
 		return
 	case *events.AppStateSyncComplete:
@@ -876,6 +915,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		}
 	case *events.Connected, *events.PushNameSetting:
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] events.Connected to Whatsapp for user '%s'", mycli.userID, mycli.WAClient.Store.PushName)
+		if _, ok := rawEvt.(*events.Connected); ok {
+			lifecycle.Default.Set(mycli.userID, lifecycle.PhaseConnected, "") // Lander patch
+		}
 		if len(mycli.WAClient.Store.PushName) > 0 {
 			doWebhook = true
 			postMap["event"] = "Connected"
@@ -958,6 +1000,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.PairSuccess:
 		doWebhook = true
 		postMap["event"] = "PairSuccess"
+		lifecycle.Default.Set(mycli.userID, lifecycle.PhasePaired, "") // Lander patch
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("QR Pair Success for user '%s' with JID '%s' - '%s'", mycli.userID, evt.ID.String(), mycli.WAClient.Store.ID.String())
 
 		instance, err := mycli.instanceRepository.GetInstanceByID(mycli.userID)
@@ -1106,6 +1149,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] User received temporary ban for %s", mycli.userID, evt.Code.String())
 		doWebhook = true
 		postMap["event"] = "TemporaryBan"
+		lifecycle.Default.Set(mycli.userID, lifecycle.PhaseFailed, "temporary ban: "+evt.Code.String()) // Lander patch
 
 		if postMap["data"] != nil {
 			jsonBytes, err := json.Marshal(postMap["data"])
@@ -1877,10 +1921,11 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		doWebhook = true
 		postMap["event"] = "LoggedOut"
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Logged out for reason %s", mycli.userID, evt.Reason.String())
+		lifecycle.Default.Set(mycli.userID, lifecycle.PhaseLoggedOut, evt.Reason.String()) // Lander patch
 
 		// Limpar cache de userInfo para esta instância
 		mycli.userInfoCache.Delete(mycli.Instance.Token)
-		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] UserInfo cache cleared for token: %s", mycli.userID, mycli.Instance.Token)
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] UserInfo cache cleared for token: %s", mycli.userID, maskToken(mycli.Instance.Token))
 
 		mycli.Instance.DisconnectReason = evt.Reason.String()
 		mycli.Instance.Connected = false
@@ -1996,10 +2041,11 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		doWebhook = true
 		postMap["event"] = "ConnectFailure"
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Connection failed with reason %s", mycli.userID, evt.Reason.String())
+		lifecycle.Default.Set(mycli.userID, lifecycle.PhaseFailed, evt.Reason.String()) // Lander patch
 
 		// Limpar cache de userInfo para esta instância
 		mycli.userInfoCache.Delete(mycli.Instance.Token)
-		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] UserInfo cache cleared for token: %s", mycli.userID, mycli.Instance.Token)
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] UserInfo cache cleared for token: %s", mycli.userID, maskToken(mycli.Instance.Token))
 
 		mycli.Instance.DisconnectReason = evt.Reason.String()
 		mycli.Instance.Connected = false
@@ -2007,13 +2053,51 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		if err != nil {
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error updating instance: %s", mycli.Instance.Id, err)
 		}
+	case *events.ClientOutdated:
+		// Lander patch (2026-11-12). whatsmeow dispatches ClientOutdated, not
+		// ConnectFailure, when WhatsApp answers 405. The original code had no
+		// case for it ("Unhandled event"), so nobody outside the logs ever saw
+		// the cause, and the Disconnected that follows restarted the client in
+		// a loop that can only fail. Now:
+		//   - instances.disconnect_reason starts with "405" (integrations read
+		//     it as "client outdated");
+		//   - a ConnectFailure webhook with Reason=405 goes out (CONNECTION
+		//     subscription), the same shape as the library ConnectFailure;
+		//   - automatic restarts are disabled for a cooldown (see lifecycle);
+		//   - the dead client is discarded (async: we are inside its handler).
+		doWebhook = true
+		postMap["event"] = "ConnectFailure"
+		waVersion := store.GetWAVersion().String()
+		outdatedReason := OutdatedDisconnectReason(waVersion)
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] WhatsApp rejected client version %s (405 client outdated). Reconnecting will not help: update the whatsmeow dependency of this server", mycli.userID, waVersion)
+		lifecycle.Default.MarkOutdated(mycli.userID, outdatedReason)
+		mycli.Instance.DisconnectReason = outdatedReason
+		mycli.Instance.Connected = false
+		if uerr := mycli.instanceRepository.UpdateConnected(mycli.Instance.Id, false, outdatedReason); uerr != nil {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error updating instance: %s", mycli.Instance.Id, uerr)
+		}
+		postMap["data"] = map[string]interface{}{
+			"Reason":        405,
+			"Message":       "client outdated",
+			"ClientVersion": waVersion,
+		}
+		go mycli.service.DiscardClient(mycli.userID, "405 client outdated")
 	case *events.Disconnected:
 		doWebhook = true
 		postMap["event"] = "Disconnected"
 
 		// Limpar cache de userInfo para esta instância (mas não para reconexão automática)
 		mycli.userInfoCache.Delete(mycli.Instance.Token)
-		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] UserInfo cache cleared for token: %s", mycli.userID, mycli.Instance.Token)
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] UserInfo cache cleared for token: %s", mycli.userID, maskToken(mycli.Instance.Token))
+
+		// Lander patch: after a 405 the socket closing is expected. Keep the
+		// "405" reason in the database (it is the useful one), drop the dead
+		// client and do NOT restart: every restart would be refused again.
+		if lifecycle.Default.OutdatedRecently(mycli.userID) {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Disconnected after 405 client outdated: not restarting", mycli.userID)
+			go mycli.service.DiscardClient(mycli.userID, "disconnected after 405")
+			break
+		}
 
 		mycli.Instance.DisconnectReason = "Disconnected emitted because the websocket is closed by the server."
 		mycli.Instance.Connected = false
@@ -2021,6 +2105,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		if err != nil {
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error updating instance: %s", mycli.Instance.Id, err)
 		}
+		lifecycle.Default.Set(mycli.userID, lifecycle.PhaseFailed, "websocket closed by the server") // Lander patch
 
 		// Trigger instance restart via websocket-capable service (non-blocking)
 		go func(instanceID string) {
@@ -2783,7 +2868,7 @@ func (w whatsmeowService) UpdateInstanceAdvancedSettings(instanceId string) erro
 }
 
 func (w whatsmeowService) ClearInstanceCache(instanceId string, token string) error {
-	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Clearing instance cache - Token: %s", instanceId, token)
+	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Clearing instance cache - Token: %s", instanceId, maskToken(token))
 
 	// Limpar userInfoCache
 	w.userInfoCache.Delete(token)
@@ -2795,9 +2880,13 @@ func (w whatsmeowService) ClearInstanceCache(instanceId string, token string) er
 	}
 
 	// Limpar clientPointer se existir
-	if _, exists := w.clientPointer[instanceId]; exists {
+	if cached, exists := w.clientPointer[instanceId]; exists {
 		delete(w.clientPointer, instanceId)
 		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Client pointer cleared", instanceId)
+		// Lander patch: close its database pool too (it leaked here as well).
+		if err := lifecycle.Default.CloseFor(instanceId, cached); err != nil {
+			w.loggerWrapper.GetLogger(instanceId).LogWarn("[%s] Error closing database pool: %v", instanceId, err)
+		}
 	}
 
 	// Limpar killChannel se existir

@@ -54,6 +54,7 @@ import (
 	newsletter_service "github.com/evolution-foundation/evolution-go/pkg/newsletter/service"
 	passkey_handler "github.com/evolution-foundation/evolution-go/pkg/passkey/handler"
 	poll_handler "github.com/evolution-foundation/evolution-go/pkg/poll/handler"
+	"github.com/evolution-foundation/evolution-go/pkg/redact"
 	routes "github.com/evolution-foundation/evolution-go/pkg/routes"
 	send_handler "github.com/evolution-foundation/evolution-go/pkg/sendMessage/handler"
 	send_service "github.com/evolution-foundation/evolution-go/pkg/sendMessage/service"
@@ -200,7 +201,11 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 	// NOVO: PollHandler usando PollService já inicializado no whatsmeowService (evita dupla inicialização)
 	pollHandler := poll_handler.NewPollHandler(whatsmeowService.GetPollService(), loggerWrapper)
 
-	r := gin.Default()
+	// Lander, 0.7.2-lander.2: o mesmo que gin.Default() (log de acesso +
+	// Recovery), com o caminho mascarado: /license/activate?code=... e
+	// /passkey-ceremony/:token iam inteiros para o log. Ver pkg/redact.
+	r := gin.New()
+	r.Use(gin.LoggerWithFormatter(logDeAcessoSemSegredo), gin.Recovery())
 
 	// CORS middleware — must be before everything else
 	r.Use(func(c *gin.Context) {
@@ -250,7 +255,7 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 		instanceId := c.Query("instanceId")
 
 		if token != config.GlobalApiKey {
-			logger.LogError("Token inválido: %s", token)
+			logger.LogError("Token inválido: %s", redact.Secret(token))
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Token inválido"})
 			return
 		}
@@ -444,4 +449,27 @@ func main() {
 	}
 
 	logger.LogInfo("[SHUTDOWN] Server exited")
+}
+
+// logDeAcessoSemSegredo é o formato padrão do Gin v1.10 (defaultLogFormatter),
+// com o caminho e a mensagem de erro passando pelo redact.
+func logDeAcessoSemSegredo(param gin.LogFormatterParams) string {
+	var corStatus, corMetodo, corFim string
+	if param.IsOutputColor() {
+		corStatus = param.StatusCodeColor()
+		corMetodo = param.MethodColor()
+		corFim = param.ResetColor()
+	}
+	if param.Latency > time.Minute {
+		param.Latency = param.Latency.Truncate(time.Second)
+	}
+	return fmt.Sprintf("[GIN] %v |%s %3d %s| %13v | %15s |%s %-7s %s %#v\n%s",
+		param.TimeStamp.Format("2006/01/02 - 15:04:05"),
+		corStatus, param.StatusCode, corFim,
+		param.Latency,
+		param.ClientIP,
+		corMetodo, param.Method, corFim,
+		redact.Path(param.Path),
+		redact.Text(param.ErrorMessage),
+	)
 }

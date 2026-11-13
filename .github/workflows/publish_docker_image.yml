@@ -26,6 +26,7 @@ jobs:
           tags: |
             type=raw,value=${{ steps.version.outputs.version }}-lander
             type=raw,value=latest
+            type=sha,prefix=${{ steps.version.outputs.version }}-lander-
 
       - uses: docker/setup-buildx-action@v3
 

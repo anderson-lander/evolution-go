@@ -20,6 +20,7 @@ import (
 	event_types "github.com/evolution-foundation/evolution-go/pkg/internal/event_types"
 	logger_wrapper "github.com/evolution-foundation/evolution-go/pkg/logger"
 	"github.com/evolution-foundation/evolution-go/pkg/utils"
+	"github.com/evolution-foundation/evolution-go/pkg/whatsmeow/lifecycle"
 	whatsmeow_service "github.com/evolution-foundation/evolution-go/pkg/whatsmeow/service"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
@@ -87,6 +88,11 @@ type StatusStruct struct {
 	LoggedIn  bool
 	myJid     *types.JID
 	Name      string
+	// Lander patch: what the process knows about the client, so callers can
+	// tell "starting", "qr", "connected", "failed" and "outdated" (405) apart
+	// instead of guessing from Connected/LoggedIn. Both are additive fields.
+	State     string
+	LastError string
 }
 
 type QrcodeStruct struct {
@@ -124,6 +130,10 @@ type ForceReconnectStruct struct {
 
 func (i *instances) ensureClientConnected(instanceId string) (*whatsmeow.Client, error) {
 	logger := i.loggerWrapper.GetLogger(instanceId)
+	// Lander patch: during the 405 cooldown, starting clients only adds load.
+	if lifecycle.Default.OutdatedRecently(instanceId) {
+		return nil, whatsmeow_service.ErrClientOutdated
+	}
 	client := i.clientPointer[instanceId]
 	logger.LogInfo("[%s] Checking client connection status - Client exists: %v", instanceId, client != nil)
 
@@ -252,6 +262,20 @@ func (i instances) Connect(data *ConnectStruct, instance *instance_model.Instanc
 	} else {
 		i.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Instance settings updated successfully in runtime", instance.Id)
 		isInstanceRunning = true
+	}
+
+	// Lander patch: "running" used to mean "registered in memory", and a
+	// client whose Connect() had failed stays registered — so this endpoint
+	// answered "already running" and did nothing, forever. A client that is
+	// neither connected nor starting is dead: drop it and start a fresh one.
+	// The pairing in the auth database is not touched.
+	if isInstanceRunning {
+		current := i.clientPointer[instance.Id]
+		if current != nil && !current.IsConnected() && !lifecycle.Default.IsStarting(instance.Id) {
+			i.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] Registered client is not connected and not starting: replacing it", instance.Id)
+			i.whatsmeowService.DiscardClient(instance.Id, "dead client found by /instance/connect")
+			isInstanceRunning = false
+		}
 	}
 
 	// Se a instância não estiver rodando, inicia uma nova
@@ -387,9 +411,12 @@ func (i instances) Status(instance *instance_model.Instance) (*StatusStruct, err
 	client := i.clientPointer[instance.Id]
 
 	if client == nil {
+		snap := lifecycle.Default.Get(instance.Id)
 		return &StatusStruct{
 			Connected: false,
 			LoggedIn:  false,
+			State:     string(snap.Phase),
+			LastError: snap.LastError,
 		}, nil
 	}
 
@@ -403,96 +430,111 @@ func (i instances) Status(instance *instance_model.Instance) (*StatusStruct, err
 		name = client.Store.PushName
 	}
 
+	snap := lifecycle.Default.Get(instance.Id)
 	return &StatusStruct{
 		Connected: isConnected,
 		LoggedIn:  isLoggedIn,
 		myJid:     myJid,
 		Name:      name,
+		State:     string(snap.Phase),
+		LastError: snap.LastError,
 	}, nil
 }
+
+// qrWait is how long GetQr waits for WhatsApp to send the first QR code
+// (Lander patch: it was a fixed 3s + 2s).
+var qrWait = 10 * time.Second
 
 func (i instances) GetQr(instance *instance_model.Instance) (*QrcodeStruct, error) {
 	logger := i.loggerWrapper.GetLogger(instance.Id)
 	client := i.clientPointer[instance.Id]
 
-	// Se não há cliente ou o cliente está logado, precisamos iniciar um novo cliente
-	if client == nil || client.IsLoggedIn() {
-		if client != nil && client.IsLoggedIn() {
-			logger.LogInfo("[%s] Client is logged in, starting new instance for QR code", instance.Id)
+	// Lander patch: a logged-in, connected session has no QR to show. The
+	// original code started a SECOND client on the same pairing here, and two
+	// clients on one pairing knock each other out.
+	if client != nil && client.IsLoggedIn() && client.IsConnected() {
+		return nil, fmt.Errorf("session already logged in")
+	}
+
+	startedAt := time.Now()
+	switch {
+	case lifecycle.Default.IsStarting(instance.Id):
+		logger.LogInfo("[%s] A start is already in progress, waiting for its QR code", instance.Id)
+	case client == nil || client.IsLoggedIn():
+		if client != nil {
+			logger.LogInfo("[%s] Client is logged in but not connected, starting it again", instance.Id)
 		} else {
 			logger.LogInfo("[%s] No client found, starting new instance for QR code", instance.Id)
 		}
-
-		// Iniciar nova instância para gerar QR code
-		err := i.whatsmeowService.StartInstance(instance.Id)
-		if err != nil {
+		if err := i.whatsmeowService.StartInstance(instance.Id); err != nil {
 			logger.LogError("[%s] Failed to start instance: %v", instance.Id, err)
 			return nil, fmt.Errorf("failed to start instance: %w", err)
 		}
+	case !client.IsConnected():
+		// Lander patch: this branch only read the qrcode column, which stays
+		// empty forever when the client died during Connect(). Replace it.
+		logger.LogWarn("[%s] Client exists but is not connected and not starting: replacing it to get a QR code", instance.Id)
+		i.whatsmeowService.DiscardClient(instance.Id, "dead client found by /instance/qr")
+		if err := i.whatsmeowService.StartInstance(instance.Id); err != nil {
+			logger.LogError("[%s] Failed to start instance: %v", instance.Id, err)
+			return nil, fmt.Errorf("failed to start instance: %w", err)
+		}
+	default:
+		logger.LogInfo("[%s] Client connected and waiting for pairing, reading the current QR code", instance.Id)
+	}
 
-		// Aguardar um pouco para o cliente iniciar e gerar QR code
-		logger.LogInfo("[%s] Waiting for QR code generation...", instance.Id)
-		time.Sleep(3 * time.Second)
-
-		// Verificar novamente se há cliente
-		client = i.clientPointer[instance.Id]
-		if client != nil && client.IsLoggedIn() {
+	deadline := time.Now().Add(qrWait)
+	for {
+		// The version refusal is the most useful answer: say it explicitly.
+		snap := lifecycle.Default.Get(instance.Id)
+		if snap.Phase == lifecycle.PhaseOutdated {
+			return nil, fmt.Errorf("whatsapp rejected the client version (405 client outdated): the server must be updated; %s", snap.LastError)
+		}
+		if c := i.clientPointer[instance.Id]; c != nil && c.IsLoggedIn() && c.IsConnected() {
 			return nil, fmt.Errorf("session already logged in")
 		}
-	} else if !client.IsConnected() {
-		// Se o cliente existe mas não está conectado, pode estar aguardando QR code
-		logger.LogInfo("[%s] Client exists but not connected, checking for existing QR code", instance.Id)
-	}
 
-	// Buscar instância atualizada do banco para pegar o QR code mais recente
-	instance, err := i.instanceRepository.GetInstanceByID(instance.Id)
-	if err != nil {
-		return nil, err
-	}
-
-	// If a passkey ceremony is in progress, there is no QR to scan — return the
-	// passkey stage + the #wapk openUrl so the manager can render the
-	// "Abrir WhatsApp Web" button. Checked before the empty-QR branch because
-	// during a passkey ceremony instance.Qrcode is empty.
-	if store := i.whatsmeowService.PasskeyCeremonyStore(); store != nil {
-		if token, state, ok := store.StateByInstance(instance.Id); ok {
-			logger.LogInfo("[%s] Passkey ceremony active (stage=%s) — returning passkey info instead of QR", instance.Id, state.Stage)
-			return &QrcodeStruct{
-				PasskeyStage:   state.Stage,
-				PasskeyCode:    state.Code,
-				PasskeyOpenURL: buildPasskeyOpenURL(token),
-			}, nil
-		}
-	}
-
-	code := instance.Qrcode
-	if code == "" {
-		// Se não há QR code ainda, aguardar um pouco mais e tentar novamente
-		logger.LogInfo("[%s] No QR code available yet, waiting a bit more...", instance.Id)
-		time.Sleep(2 * time.Second)
-
-		instance, err = i.instanceRepository.GetInstanceByID(instance.Id)
+		// Buscar instância atualizada do banco para pegar o QR code mais recente
+		fresh, err := i.instanceRepository.GetInstanceByID(instance.Id)
 		if err != nil {
 			return nil, err
 		}
 
-		code = instance.Qrcode
-		if code == "" {
+		// If a passkey ceremony is in progress, there is no QR to scan — return the
+		// passkey stage + the #wapk openUrl so the manager can render the
+		// "Abrir WhatsApp Web" button. Checked before the empty-QR branch because
+		// during a passkey ceremony instance.Qrcode is empty.
+		if store := i.whatsmeowService.PasskeyCeremonyStore(); store != nil {
+			if token, state, ok := store.StateByInstance(instance.Id); ok {
+				logger.LogInfo("[%s] Passkey ceremony active (stage=%s) — returning passkey info instead of QR", instance.Id, state.Stage)
+				return &QrcodeStruct{
+					PasskeyStage:   state.Stage,
+					PasskeyCode:    state.Code,
+					PasskeyOpenURL: buildPasskeyOpenURL(token),
+				}, nil
+			}
+		}
+
+		if code := fresh.Qrcode; code != "" {
+			parts := strings.Split(code, "|")
+			if len(parts) < 2 {
+				return nil, fmt.Errorf("invalid QR code format")
+			}
+			return &QrcodeStruct{
+				Qrcode: parts[0],
+				Code:   parts[1],
+			}, nil
+		}
+
+		// A failure of the attempt started by THIS request ends the wait.
+		if snap.Phase == lifecycle.PhaseFailed && snap.Since.After(startedAt) && !lifecycle.Default.IsStarting(instance.Id) {
+			return nil, fmt.Errorf("connection to WhatsApp failed, no QR code: %s", snap.LastError)
+		}
+		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("no QR code available. Please wait a moment and try again")
 		}
+		time.Sleep(500 * time.Millisecond)
 	}
-
-	parts := strings.Split(code, "|")
-	if len(parts) < 2 {
-		return nil, fmt.Errorf("invalid QR code format")
-	}
-
-	qr := &QrcodeStruct{
-		Qrcode: parts[0],
-		Code:   parts[1],
-	}
-
-	return qr, nil
 }
 
 // buildPasskeyOpenURL builds the URL the manager opens to start the passkey
@@ -735,17 +777,13 @@ func (i instances) ForceReconnect(instanceId string, number string) error {
 		}
 	}
 
+	// Lander patch: discard the old client directly (event handler removed,
+	// database pool closed, maps cleaned only if they still point to it). The
+	// kill signal used here made the old loop RESTART the client while this
+	// function started another one, and the kill channel created above was
+	// deleted right after, leaving the new client impossible to kill.
 	if i.clientPointer[instance.Id] != nil {
-		client := i.clientPointer[instance.Id]
-		client.Disconnect()
-
-		select {
-		case i.killChannel[instance.Id] <- true:
-		case <-time.After(5 * time.Second):
-		}
-
-		delete(i.clientPointer, instance.Id)
-		delete(i.killChannel, instance.Id)
+		i.whatsmeowService.DiscardClient(instance.Id, "force reconnect")
 	}
 
 	go i.whatsmeowService.StartClient(clientData)

@@ -25,6 +25,7 @@ import (
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
 	logger_wrapper "github.com/evolution-foundation/evolution-go/pkg/logger"
 	"github.com/evolution-foundation/evolution-go/pkg/utils"
+	"github.com/evolution-foundation/evolution-go/pkg/whatsmeow/lifecycle"
 	whatsmeow_service "github.com/evolution-foundation/evolution-go/pkg/whatsmeow/service"
 	"github.com/gabriel-vasile/mimetype"
 	"go.mau.fi/whatsmeow"
@@ -380,6 +381,13 @@ type MessageSendStruct struct {
 }
 
 func (s *sendService) ensureClientConnected(instanceId string) (*whatsmeow.Client, error) {
+	// Lander patch: during the 405 cooldown every start fails the same way.
+	// On 10/11/2026 two sends to an instance in that state started 5 clients
+	// in 23 seconds. The error text is not one of the two the retry loop
+	// retries on, so the request fails fast.
+	if lifecycle.Default.OutdatedRecently(instanceId) {
+		return nil, whatsmeow_service.ErrClientOutdated
+	}
 	client := s.clientPointer[instanceId]
 	s.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Checking client connection status - Client exists: %v", instanceId, client != nil)
 

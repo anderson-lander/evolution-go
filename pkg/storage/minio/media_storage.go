@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/evolution-foundation/evolution-go/pkg/redact"
 	storage_interfaces "github.com/evolution-foundation/evolution-go/pkg/storage/interfaces"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -110,7 +111,8 @@ func (m *MinioMediaStorage) Store(ctx context.Context, data []byte, fileName str
 		return "", fmt.Errorf("failed to generate presigned URL: %w", err)
 	}
 
-	fmt.Println(presignedURL.String())
+	// Lander, 0.7.2-lander.2: a URL assinada é credencial temporária.
+	fmt.Println(redact.Text(presignedURL.String()))
 
 	return presignedURL.String(), nil
 }
@@ -149,7 +151,8 @@ func (m *MinioMediaStorage) GetURL(ctx context.Context, fileName string) (string
 		return "", fmt.Errorf("failed to generate presigned URL: %w", err)
 	}
 
-	fmt.Println(presignedURL.String())
+	// Lander, 0.7.2-lander.2: a URL assinada é credencial temporária.
+	fmt.Println(redact.Text(presignedURL.String()))
 
 	return presignedURL.String(), nil
 }
